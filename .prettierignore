@@ -1,0 +1,7 @@
+dist
+node_modules
+.canvasflow
+.canvas-flow
+canvasflow-code-review.html
+package-lock.json
+.claude/settings.local.json

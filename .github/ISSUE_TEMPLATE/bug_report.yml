@@ -1,0 +1,56 @@
+name: Bug report
+description: Something went wrong with Canvas Flow
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A short description of what you expected and what actually happened.
+      placeholder: I ran `canvas-flow ./review.html`, opened the browser URL, and annotations did not reach the agent.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: How to reproduce
+      description: The commands you ran and anything about the HTML artifact that matters.
+      placeholder: |
+        1. Create `review.html`
+        2. Run `canvas-flow ./review.html`
+        3. Send a prompt from the browser
+        4. Run `canvas-flow poll ./review.html`
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: canvas-flow version
+      description: Output of `canvas-flow --version` or the npm package version.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Node version
+      description: From `node --version` and your OS.
+      placeholder: "macOS 15 / Node v24.13.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: CLI output
+      description: Paste relevant structured output or errors from `canvas-flow`.
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Screenshots, hunches, related issues, whatever seems relevant.

@@ -1,0 +1,69 @@
+{
+  "name": "@menukfernandoo/canvas-flow",
+  "version": "0.2.0",
+  "packageManager": "pnpm@11.1.1",
+  "description": "HTML is the new markdown. CanvasFlow is the new editor for your HTML artifacts.",
+  "type": "module",
+  "bin": {
+    "canvas-flow": "dist/cli.mjs"
+  },
+  "files": [
+    "dist",
+    "skills/canvasflow",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.js",
+    "build:skill": "node scripts/build-skill.js",
+    "check": "npm run build && npm run lint && npm run format:check && npm run typecheck && npm test && node scripts/build-skill.js --check",
+    "start": "node dist/cli.mjs",
+    "lint": "eslint bin src test scripts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepack": "npm run build",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tailwindcss/browser": "4.2.4",
+    "axi-sdk-js": "^0.1.8",
+    "chokidar": "^4.0.3",
+    "daisyui": "^5.5.19",
+    "express": "^5.2.1",
+    "open": "^10.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/node": "^25.6.2",
+    "esbuild": "^0.28.0",
+    "eslint": "^10.3.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.6.0",
+    "prettier": "^3.8.3",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "axi",
+    "agent",
+    "cli",
+    "html",
+    "review",
+    "collaboration"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fernandomenuk/canvas-flow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fernandomenuk/canvas-flow/issues"
+  },
+  "homepage": "https://github.com/fernandomenuk/canvas-flow#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}
