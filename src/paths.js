@@ -52,6 +52,12 @@ export function serverLogFile() {
   return path.join(stateDir(), "server.log");
 }
 
+// Sidecar dir holding saved artifact version snapshots for a session, one <n>.html per version.
+// Kept out of state.json so large HTML blobs don't bloat the whole-file read-modify-write there.
+export function versionsDir(key) {
+  return path.join(stateDir(), "versions", key);
+}
+
 export async function ensureStateDir() {
   await mkdir(stateDir(), { recursive: true });
 }

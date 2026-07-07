@@ -43,6 +43,7 @@ export class SessionStore {
       delivered_layout_warning_keys: existing.delivered_layout_warning_keys || [],
       dom_snapshot: existing.dom_snapshot || "",
       chat: existing.chat || [],
+      versions: existing.versions || [],
       updated_at: new Date().toISOString(),
     };
     state.sessions[key] = session;
@@ -177,6 +178,32 @@ export class SessionStore {
     session.updated_at = new Date().toISOString();
     await this.writeState(state);
     return session;
+  }
+
+  // Version snapshots: metadata only lives here; the HTML bytes are written to a sidecar file by
+  // the server (see versionsDir). `n` is 1-based and assigned in order, so it doubles as the file name.
+  async appendVersion(key, { at, bytes, sha256 }) {
+    const state = await this.readState();
+    const session = state.sessions[key];
+    if (!session) {
+      return null;
+    }
+    const versions = session.versions || [];
+    const entry = { n: versions.length + 1, at: at || new Date().toISOString(), bytes, sha256 };
+    session.versions = [...versions, entry];
+    session.updated_at = new Date().toISOString();
+    await this.writeState(state);
+    return entry;
+  }
+
+  async listVersions(key) {
+    const session = await this.findByKey(key);
+    return session?.versions || [];
+  }
+
+  async getVersion(key, n) {
+    const session = await this.findByKey(key);
+    return (session?.versions || []).find((version) => version.n === n) || null;
   }
 
   async readState() {

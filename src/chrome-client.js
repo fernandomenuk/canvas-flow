@@ -44,6 +44,21 @@ const shareUrlInput = /** @type {HTMLInputElement} */ (document.getElementById("
 const shareUpdateKeyInput = /** @type {HTMLInputElement} */ (document.getElementById("shareUpdateKey"));
 const copyShareUrlButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyShareUrl"));
 const copyUpdateKeyButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyUpdateKey"));
+const saveVersionButton = /** @type {HTMLButtonElement} */ (document.getElementById("saveVersion"));
+const openHistoryButton = /** @type {HTMLButtonElement} */ (document.getElementById("openHistory"));
+const historyDialog = /** @type {HTMLDivElement} */ (document.getElementById("historyDialog"));
+const historyCloseButton = /** @type {HTMLButtonElement} */ (document.getElementById("historyClose"));
+const historyListView = /** @type {HTMLDivElement} */ (document.getElementById("historyListView"));
+const historyList = /** @type {HTMLDivElement} */ (document.getElementById("historyList"));
+const historyEmpty = /** @type {HTMLDivElement} */ (document.getElementById("historyEmpty"));
+const historyHint = /** @type {HTMLSpanElement} */ (document.getElementById("historyHint"));
+const historyCompareButton = /** @type {HTMLButtonElement} */ (document.getElementById("historyCompare"));
+const historyCompareView = /** @type {HTMLDivElement} */ (document.getElementById("historyCompareView"));
+const historyBackButton = /** @type {HTMLButtonElement} */ (document.getElementById("historyBack"));
+const historyCompareLabelA = /** @type {HTMLSpanElement} */ (document.getElementById("historyCompareLabelA"));
+const historyCompareLabelB = /** @type {HTMLSpanElement} */ (document.getElementById("historyCompareLabelB"));
+const historyFrameA = /** @type {HTMLIFrameElement} */ (document.getElementById("historyFrameA"));
+const historyFrameB = /** @type {HTMLIFrameElement} */ (document.getElementById("historyFrameB"));
 const endButton = /** @type {HTMLButtonElement} */ (document.getElementById("end"));
 const copyPathButton = /** @type {HTMLButtonElement} */ (document.getElementById("copyPath"));
 const copyHint = /** @type {HTMLSpanElement} */ (document.getElementById("copyHint"));
@@ -78,6 +93,10 @@ let layoutGateTimer;
 const snapshotRequests = [];
 let endAfterSubmit = false;
 let workingBubble = null;
+/** @type {Array<{n:number, at:string, bytes:number, sha256:string}>} */
+let historyVersions = [];
+/** @type {number[]} */
+let historySelection = [];
 let submitQueuedPromise = null;
 let submitQueuedAgain = false;
 let lastScroll = { x: 0, y: 0 };
@@ -646,6 +665,181 @@ async function publishShare(event) {
   }
 }
 
+async function saveVersion() {
+  saveVersionButton.disabled = true;
+  const label = saveVersionButton.querySelector("span");
+  const original = label ? label.textContent : "";
+  try {
+    const response = await fetch("/api/" + key + "/version", { method: "POST" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "save failed");
+    if (label) label.textContent = data.deduped ? "Already saved (v" + data.n + ")" : "Saved as version " + data.n;
+    if (!historyDialog.hidden) await loadVersions();
+  } catch {
+    if (label) label.textContent = "Save failed - retry";
+  } finally {
+    saveVersionButton.disabled = false;
+    setTimeout(() => {
+      if (label) label.textContent = original;
+    }, 1600);
+  }
+}
+
+async function openHistory() {
+  closeMenus();
+  showHistoryList();
+  historySelection = [];
+  historyDialog.hidden = false;
+  await loadVersions();
+}
+
+function closeHistory() {
+  historyDialog.hidden = true;
+  historyFrameA.src = "about:blank";
+  historyFrameB.src = "about:blank";
+}
+
+function showHistoryList() {
+  historyCompareView.hidden = true;
+  historyListView.hidden = false;
+}
+
+async function loadVersions() {
+  try {
+    const response = await fetch("/api/" + key + "/versions");
+    const data = await response.json();
+    historyVersions = Array.isArray(data.versions) ? data.versions : [];
+  } catch {
+    historyVersions = [];
+  }
+  // Drop selections for versions that no longer exist (defensive; versions are append-only today).
+  const present = new Set(historyVersions.map((version) => version.n));
+  historySelection = historySelection.filter((n) => present.has(n));
+  renderVersions();
+}
+
+function renderVersions() {
+  historyEmpty.hidden = historyVersions.length > 0;
+  // Newest first so the latest checkpoint is at the top of the timeline.
+  historyList.innerHTML = [...historyVersions]
+    .reverse()
+    .map((version) => {
+      const checked = historySelection.includes(version.n) ? " checked" : "";
+      return (
+        '<div class="history-row">' +
+        '<label class="history-check"><input type="checkbox" data-compare="' +
+        version.n +
+        '"' +
+        checked +
+        "></label>" +
+        '<div class="history-meta"><span class="history-name">Version ' +
+        version.n +
+        '</span><span class="history-sub">' +
+        escapeHtml(formatVersionTime(version.at)) +
+        " · " +
+        formatBytes(version.bytes) +
+        "</span></div>" +
+        '<div class="history-row-actions">' +
+        '<button class="history-btn" type="button" data-restore="' +
+        version.n +
+        '">Restore</button>' +
+        '<button class="history-btn" type="button" data-export="' +
+        version.n +
+        '">Export</button>' +
+        "</div></div>"
+      );
+    })
+    .join("");
+  updateCompareButton();
+}
+
+function updateCompareButton() {
+  const ready = historySelection.length === 2;
+  historyCompareButton.disabled = !ready;
+  historyHint.textContent = ready
+    ? "Comparing versions " + [...historySelection].sort((a, b) => a - b).join(" and ") + "."
+    : "Select two versions to compare.";
+}
+
+async function restoreVersion(n) {
+  const button = /** @type {HTMLButtonElement | null} */ (
+    historyList.querySelector('button[data-restore="' + n + '"]')
+  );
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Restoring...";
+  }
+  try {
+    const response = await fetch("/api/" + key + "/version/" + n + "/restore", { method: "POST" });
+    if (!response.ok) throw new Error("restore failed");
+    // The server write trips the file watcher, whose SSE reload refreshes the iframe - that reload
+    // is the visible confirmation. A fresh checkpoint of the pre-restore state was just added.
+    closeHistory();
+  } catch {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Restore failed";
+    }
+  }
+}
+
+async function exportVersion(n) {
+  const button = /** @type {HTMLButtonElement | null} */ (historyList.querySelector('button[data-export="' + n + '"]'));
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Exporting...";
+  }
+  try {
+    const response = await fetch("/api/" + key + "/version/" + n + "/export");
+    if (!response.ok) throw new Error("export failed");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = exportFileName().replace(/\.export\.html$/i, ".v" + n + ".export.html");
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  } catch {
+    // Silent - the button state below is the only feedback needed for a failed download.
+  } finally {
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Export";
+    }
+  }
+}
+
+function enterCompare() {
+  if (historySelection.length !== 2) return;
+  const [a, b] = [...historySelection].sort((x, y) => x - y);
+  historyCompareLabelA.textContent = "Version " + a;
+  historyCompareLabelB.textContent = "Version " + b;
+  historyFrameA.src = "/artifact/" + key + "/version/" + a + "/index.html";
+  historyFrameB.src = "/artifact/" + key + "/version/" + b + "/index.html";
+  historyListView.hidden = true;
+  historyCompareView.hidden = false;
+}
+
+function formatBytes(bytes) {
+  const value = Number(bytes) || 0;
+  if (value < 1024) return value + " B";
+  if (value < 1024 * 1024) return (value / 1024).toFixed(1) + " KB";
+  return (value / (1024 * 1024)).toFixed(1) + " MB";
+}
+
+function formatVersionTime(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "";
+  const minutes = Math.round((Date.now() - date.getTime()) / 60000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return minutes + " min ago";
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return hours + " hr ago";
+  return date.toLocaleString();
+}
+
 function resetFrame() {
   startLayoutGateCycle();
   // The iframe is sandboxed, so reload by resetting the iframe URL from chrome.
@@ -746,6 +940,39 @@ shareDialog.addEventListener("click", (event) => {
 });
 copyShareUrlButton.onclick = () => copyToButton(shareUrlInput.value, copyShareUrlButton, "Copy URL");
 copyUpdateKeyButton.onclick = () => copyToButton(shareUpdateKeyInput.value, copyUpdateKeyButton, "Copy key");
+saveVersionButton.onclick = saveVersion;
+openHistoryButton.onclick = openHistory;
+historyCloseButton.onclick = closeHistory;
+historyBackButton.onclick = showHistoryList;
+historyCompareButton.onclick = enterCompare;
+historyDialog.addEventListener("click", (event) => {
+  if (event.target === historyDialog) closeHistory();
+});
+historyList.addEventListener("click", (event) => {
+  const button = /** @type {HTMLElement | null} */ (/** @type {HTMLElement} */ (event.target).closest("button"));
+  if (!button) return;
+  if (button.dataset.restore) restoreVersion(Number(button.dataset.restore));
+  else if (button.dataset.export) exportVersion(Number(button.dataset.export));
+});
+historyList.addEventListener("change", (event) => {
+  const input = /** @type {HTMLInputElement} */ (event.target);
+  if (!input.dataset || !input.dataset.compare) return;
+  const n = Number(input.dataset.compare);
+  if (input.checked) {
+    historySelection.push(n);
+    // Keep only the two most recent picks; unchecking the oldest keeps the compare limited to a pair.
+    while (historySelection.length > 2) {
+      const dropped = historySelection.shift();
+      const box = /** @type {HTMLInputElement | null} */ (
+        historyList.querySelector('input[data-compare="' + dropped + '"]')
+      );
+      if (box) box.checked = false;
+    }
+  } else {
+    historySelection = historySelection.filter((value) => value !== n);
+  }
+  updateCompareButton();
+});
 endButton.onclick = () => {
   closeMenus();
   endSession();
@@ -759,6 +986,9 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (!shareDialog.hidden) {
       closeShareDialog();
+    } else if (!historyDialog.hidden) {
+      if (!historyCompareView.hidden) showHistoryList();
+      else closeHistory();
     } else {
       closeMenus();
     }
