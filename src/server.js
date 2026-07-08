@@ -1,6 +1,7 @@
+import crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,7 +29,7 @@ import {
 } from "./export-bundle.js";
 import { publishToHtmlApp } from "./html-app.js";
 import { injectCanvasFlowSdk } from "./html-transform.js";
-import { bindHost, hostForUrl, linkHost } from "./paths.js";
+import { bindHost, hostForUrl, linkHost, versionsDir } from "./paths.js";
 import { canonicalFile, SessionStore, sessionKey } from "./session-store.js";
 
 const chromeClientUrl = new URL("./chrome-client.js", import.meta.url);
@@ -282,17 +283,99 @@ export async function serve({
         return;
       }
       const source = await readFile(session.file, "utf8");
-      const root = path.dirname(session.file);
-      const { html, warnings } = await buildSelfContainedHtml(source, {
-        baseDir: root,
-        confineDir: root,
-        resolveAbsolute: resolveDesignAssetPath,
-      });
-      const { unresolved, notices } = splitExportWarnings(warnings);
-      res.setHeader("content-disposition", exportContentDisposition(session.file));
-      res.setHeader("x-canvasflow-export-warning-count", String(unresolved.length));
-      res.setHeader("x-canvasflow-export-notice-count", String(notices.length));
-      res.type("html").send(html);
+      await sendArtifactExport(res, session, source);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Version history: manual snapshots of the artifact the user can restore, compare, and export.
+  // Bytes live in a sidecar file (versionsDir/<n>.html); only lightweight metadata is kept on the
+  // session. Save/restore are local-loopback mutations like /prompts, so they skip the same-origin
+  // gate that /share needs (that one publishes to a third-party host).
+
+  // Save the current artifact content as a new version. A no-op save (content identical to the
+  // newest version) returns that version instead of duplicating it.
+  app.post("/api/:key/version", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const entry = await captureVersion(store, session, req.params.key);
+      res.json({ n: entry.n, at: entry.at, deduped: entry.deduped === true });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/versions", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      res.json({ versions: await store.listVersions(req.params.key) });
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Restore a version by writing its bytes back to the artifact file. The current content is
+  // captured first so restore is non-destructive (it doubles as Undo). The file write trips the
+  // existing watcher, which reloads the browser - no separate reload path needed here.
+  app.post("/api/:key/version/:n/restore", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const result = await restoreArtifactVersion(store, session, req.params.key, Number(req.params.n));
+      if (!result) {
+        res.status(404).json({ error: "version not found" });
+        return;
+      }
+      res.json(result);
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Render a saved version for the compare iframes. A <base> tag points relative asset refs at the
+  // live artifact asset route; assets are current-on-disk, not snapshotted per version.
+  app.get(/^\/artifact\/([^/]+)\/version\/(\d+)\/index\.html$/, async (req, res, next) => {
+    try {
+      const key = req.params[0];
+      const n = Number(req.params[1]);
+      const session = await store.findByKey(key);
+      if (!session || !(await store.getVersion(key, n))) {
+        res.status(404).send("Version not found");
+        return;
+      }
+      const html = await readFile(versionFilePath(key, n), "utf8");
+      res.type("html").send(withArtifactBase(html, key));
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  app.get("/api/:key/version/:n/export", async (req, res, next) => {
+    try {
+      const session = await store.findByKey(req.params.key);
+      if (!session) {
+        res.status(404).json({ error: "session not found" });
+        return;
+      }
+      const n = Number(req.params.n);
+      if (!(await store.getVersion(req.params.key, n))) {
+        res.status(404).json({ error: "version not found" });
+        return;
+      }
+      const source = await readFile(versionFilePath(req.params.key, n), "utf8");
+      await sendArtifactExport(res, session, source);
     } catch (error) {
       next(error);
     }
@@ -610,6 +693,68 @@ export function exportContentDisposition(file) {
   return `attachment; filename="${sanitizeDispositionFilename(filename)}"; filename*=UTF-8''${encodeRfc5987Value(filename)}`;
 }
 
+// Inline `source` HTML into a portable standalone file and stream it as a download. Shared by the
+// live export route and the per-version export route so they stay byte-identical apart from `source`.
+// Local assets are inlined from the current artifact dir (`session.file`'s dir), so a version export
+// carries today's sibling assets, not the assets as they were when that version was saved.
+async function sendArtifactExport(res, session, source) {
+  const root = path.dirname(session.file);
+  const { html, warnings } = await buildSelfContainedHtml(source, {
+    baseDir: root,
+    confineDir: root,
+    resolveAbsolute: resolveDesignAssetPath,
+  });
+  const { unresolved, notices } = splitExportWarnings(warnings);
+  res.setHeader("content-disposition", exportContentDisposition(session.file));
+  res.setHeader("x-canvasflow-export-warning-count", String(unresolved.length));
+  res.setHeader("x-canvasflow-export-notice-count", String(notices.length));
+  res.type("html").send(html);
+}
+
+export function versionFilePath(key, n) {
+  return path.join(versionsDir(key), `${n}.html`);
+}
+
+// Snapshot the current artifact content as a new version. Writes the bytes to a sidecar file first
+// so a failed metadata append leaves at most a harmless orphan file (never metadata pointing at a
+// missing file). A save whose content matches the newest version is a no-op that returns it with
+// `deduped: true`.
+export async function captureVersion(store, session, key) {
+  const source = await readFile(session.file, "utf8");
+  const sha256 = crypto.createHash("sha256").update(source).digest("hex");
+  const versions = await store.listVersions(key);
+  const newest = versions[versions.length - 1];
+  if (newest && newest.sha256 === sha256) {
+    return { ...newest, deduped: true };
+  }
+  await mkdir(versionsDir(key), { recursive: true });
+  await writeFile(versionFilePath(key, versions.length + 1), source);
+  return store.appendVersion(key, { at: new Date().toISOString(), bytes: Buffer.byteLength(source), sha256 });
+}
+
+// Restore version `n` by writing its bytes back to the artifact file, after first checkpointing the
+// current content so the restore is reversible (Undo). Returns null when the version doesn't exist.
+export async function restoreArtifactVersion(store, session, key, n) {
+  const version = await store.getVersion(key, n);
+  if (!version) {
+    return null;
+  }
+  const bytes = await readFile(versionFilePath(key, n), "utf8");
+  await captureVersion(store, session, key);
+  await writeFile(session.file, bytes);
+  return { restored: n };
+}
+
+// ponytail: relative asset refs only; a <base> points them at the live artifact dir, so a compared
+// version shows today's assets. Snapshot the asset tree per version if that ever matters.
+function withArtifactBase(html, key) {
+  const base = `<base href="/artifact/${key}/">`;
+  if (/<head[^>]*>/i.test(html)) {
+    return html.replace(/<head[^>]*>/i, (head) => `${head}${base}`);
+  }
+  return `${base}${html}`;
+}
+
 function sanitizeDispositionFilename(filename) {
   const fallback = Array.from(String(filename || ""), (char) => {
     const codePoint = char.codePointAt(0) || 0;
@@ -796,6 +941,8 @@ const chromeIcons = {
   ),
   send: chromeIcon('<path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/>', 14),
   caret: chromeIcon('<path d="m6 9 6 6 6-6"/>', 13, 2),
+  save: chromeIcon('<path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>', 15),
+  history: chromeIcon('<path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><path d="M12 7v5l4 2"/>', 15),
 };
 
 // Display the path with the home directory shortened to "~", split so the directory part can
@@ -872,9 +1019,10 @@ export function createChromeHtml(session, { layoutGateEnabled = true } = {}) {
 <link rel="stylesheet" href="/chrome.css">
 </head>
 <body class="${bodyClass}">
-<div class="bar"><div class="brand"><span class="brand-mark">canvas<span class="brand-flow">flow</span></span><span class="brand-support">review</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
+<div class="bar"><div class="brand"><span class="brand-mark">canvas<span class="brand-flow">flow</span></span><span class="brand-support">review</span></div><div class="spacer" aria-hidden="true"></div><button class="annotate-switch" id="annotation" type="button" aria-pressed="true" title="${escapeHtml(modeToggleHint)}"><span class="switch-track" aria-hidden="true"><span class="switch-knob"></span></span><span>Annotate</span></button><div class="more-wrap" id="moreWrap"><button class="more-button" id="moreButton" type="button" title="More" aria-haspopup="menu" aria-expanded="false">${chromeIcons.more}</button><div class="menu more-menu" id="moreMenu" hidden><div class="menu-head"><div class="menu-label">Editing</div><button class="menu-file" id="copyPath" type="button" title="Copy path · ${escapeHtml(session.file)}">${chromeIcons.file}<span class="menu-file-text"><span class="path-head">${escapeHtml(pathHead)}</span><span class="path-tail">${escapeHtml(pathTail)}</span></span><span class="copy-hint" id="copyHint"><span class="icon-copy">${chromeIcons.copy}</span><span class="icon-check">${chromeIcons.check}</span><span id="copyHintText">Copy</span></span></button></div><div class="menu-rule"></div><button class="menu-item" id="reloadArtifact" type="button">${chromeIcons.refresh}<span>Reload artifact</span></button><button class="menu-item" id="saveVersion" type="button">${chromeIcons.save}<span>Save version</span></button><button class="menu-item" id="openHistory" type="button">${chromeIcons.history}<span>Version history</span></button><button class="menu-item" id="copySnapshot" type="button">${chromeIcons.camera}<span>Copy DOM snapshot</span></button><button class="menu-item" id="exportArtifact" type="button">${chromeIcons.download}<span>Export standalone HTML</span></button><button class="menu-item" id="shareArtifact" type="button">${chromeIcons.globe}<span>Publish link</span></button><div class="menu-rule"></div><button class="menu-item danger" id="end" type="button">${chromeIcons.exit}<span>End session</span></button></div></div></div>
 <div class="layout"><div class="frame"><iframe id="artifact" sandbox="allow-scripts allow-forms allow-popups allow-downloads" data-artifact-src="/artifact/${session.key}/index.html"></iframe><div class="layout-issue-banner" id="layoutIssueBanner" hidden>This surface may have layout issues. Your agent has been notified.</div></div><aside class="panel"><h2>Conversation</h2><div class="chat" id="chatLog"></div><div class="composer"><div class="presence-banner" id="presenceBanner" hidden>Your agent is not listening. If this persists, ask your agent to poll for updates from CanvasFlow.</div><div class="annotation-pills" id="annotationPills"></div><textarea id="chatInput" placeholder="Write a message for the agent..."></textarea><div class="actions" id="sendActions"><span class="send-hint" id="sendHint" hidden>Write a message or annotate an element first.</span><div class="split"><button class="button send-main" id="send">Send to Agent</button><button class="button send-caret" id="sendCaret" type="button" title="Send options" aria-haspopup="menu" aria-expanded="false">${chromeIcons.caret}</button></div><div class="menu send-menu" id="sendMenu" hidden><button class="menu-item" id="sendFromMenu" type="button">${chromeIcons.send}<span>Send to Agent</span></button><button class="menu-item danger" id="sendAndEnd" type="button">${chromeIcons.exit}<span>Send &amp; end session</span></button></div></div></div></aside></div>
 <div class="share-overlay" id="shareDialog" role="dialog" aria-modal="true" aria-labelledby="shareTitleText" hidden><form class="share-card" id="shareForm"><div class="share-head"><div><div class="share-kicker">Publish to <a class="share-link" href="https://ht-ml.app" target="_blank" rel="noopener noreferrer">ht-ml.app</a></div><h2 id="shareTitleText">Publish artifact</h2></div><button class="share-close" id="shareClose" type="button" aria-label="Close publish dialog"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><p class="share-note">ht-ml.app is a separate, third-party hosting service, not part of CanvasFlow. Publishing sends this artifact to its servers.</p><p class="share-copy">This uploads this artifact to ht-ml.app with local assets inlined. Without a password, the page is PUBLIC and anyone with the link can open it. With a password, the page is PRIVATE and viewers must supply the password to view.</p><p class="share-note">Do not publish secrets. The CanvasFlow annotation SDK is not included.</p><div class="share-grid"><label>Password (optional)<input id="sharePassword" name="password" type="password" autocomplete="new-password" placeholder="Leave blank for a public page"></label></div><div class="share-status" id="shareStatus" role="status"></div><div class="share-result" id="shareResult" hidden><label>Share URL<div class="share-copy-row"><input id="shareUrl" readonly><button class="share-copy-btn" id="copyShareUrl" type="button">Copy URL</button></div></label><label>Update key (secret)<div class="share-copy-row"><input id="shareUpdateKey" readonly><button class="share-copy-btn" id="copyUpdateKey" type="button">Copy key</button></div></label><p class="share-note">Keep the update key private. ht-ml.app returns it once and it is the only way to update or delete this page later.</p></div><div class="share-actions"><button class="share-cancel" id="shareCancel" type="button">Cancel</button><button class="button" id="sharePublish" type="submit">Publish</button></div></form></div>
+<div class="share-overlay" id="historyDialog" role="dialog" aria-modal="true" aria-labelledby="historyTitleText" hidden><div class="share-card history-card"><div class="share-head"><div><div class="share-kicker">Like git, but visual</div><h2 id="historyTitleText">Version history</h2></div><button class="share-close" id="historyClose" type="button" aria-label="Close version history"><svg width="14" height="14" viewBox="0 0 10 10" fill="none" aria-hidden="true" focusable="false"><path d="M1 1L9 9M9 1L1 9" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg></button></div><div class="history-view" id="historyListView"><p class="share-note">Saved snapshots of this artifact. Restore is non-destructive — it checkpoints the current state first, so it doubles as undo. Tick two versions to compare them side by side.</p><div class="history-list" id="historyList"></div><div class="history-empty" id="historyEmpty" hidden>No versions saved yet. Use <strong>Save version</strong> to checkpoint this artifact.</div><div class="history-foot"><span class="history-hint" id="historyHint">Select two versions to compare.</span><button class="button" id="historyCompare" type="button" disabled>Compare selected</button></div></div><div class="history-view history-compare" id="historyCompareView" hidden><div class="history-compare-head"><button class="share-cancel" id="historyBack" type="button">← Back to list</button><div class="history-compare-labels"><span id="historyCompareLabelA"></span><span id="historyCompareLabelB"></span></div></div><div class="history-compare-panes"><iframe id="historyFrameA" title="Left version" sandbox="allow-scripts allow-forms allow-popups"></iframe><iframe id="historyFrameB" title="Right version" sandbox="allow-scripts allow-forms allow-popups"></iframe></div></div></div></div>
 <div class="ended-overlay layout-gate-overlay" id="layoutGateOverlay"${layoutGateHidden}><div class="ended-card"><div class="ended-title" id="layoutGateTitle">Checking layout.<br>One moment.</div><p class="ended-copy" id="layoutGateCopy">CanvasFlow is waiting for fonts and final geometry before revealing this artifact.</p><button class="button ended-action" id="layoutGateAction" type="button">Show anyway</button></div></div>
 <div class="ended-overlay" id="endedOverlay" hidden><div class="ended-card"><div class="ended-title">Session ended.<br>Return to your agent to continue.</div><p class="ended-copy">${escapeHtml(session.file)}</p></div></div>
 <script id="canvasflow-session" type="application/json">${sessionJson}</script>
